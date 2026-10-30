@@ -1,5 +1,6 @@
 package com.playertags;
 
+import java.util.Locale;
 import java.awt.Color;
 import net.runelite.client.config.Config;
 import net.runelite.client.config.ConfigGroup;
@@ -108,4 +109,5 @@ public interface PlayerTagsConfig extends Config
     {
         return 12;
     }
+
 }

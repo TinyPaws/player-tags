@@ -1,21 +1,40 @@
+
 package com.playertags;
 
 import com.google.inject.Provides;
+import com.google.gson.JsonObject;
+import java.util.Map;
+import java.util.Set;
+import java.util.Locale;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.logging.Level;
+import java.util.logging.Logger;
 import javax.inject.Inject;
 import net.runelite.api.Client;
 import net.runelite.api.Player;
+import net.runelite.api.events.GameTick;
+import net.runelite.client.eventbus.Subscribe;
 import net.runelite.client.config.ConfigManager;
 import net.runelite.client.plugins.Plugin;
 import net.runelite.client.plugins.PluginDescriptor;
 import net.runelite.client.ui.overlay.OverlayManager;
 
 @PluginDescriptor(
-    name = "Player Tags",
-    description = "Shows custom player tags and pronouns in a hover tooltip",
-    tags = {"players", "custom", "tags", "pronouns", "tooltip"}
+        name = "Player Tags",
+        description = "Shows custom player tags and pronouns in a hover tooltip",
+        tags = {"players", "custom", "tags", "pronouns", "tooltip"}
 )
 public class PlayerTagsPlugin extends Plugin
 {
+    private static final Logger logger =
+            Logger.getLogger(PlayerTagsPlugin.class.getName());
+
+    private static final long CACHE_TIME_MS = 5 * 60 * 1000;
+    private static final long FAILED_LOOKUP_TIME_MS = 30 * 1000;
+    private static final long PUBLISH_RETRY_MS = 60 * 1000;
+
     @Inject
     private Client client;
 
@@ -27,6 +46,27 @@ public class PlayerTagsPlugin extends Plugin
 
     @Inject
     private PlayerTagsOverlay overlay;
+
+    @Inject
+    private SharedTagService sharedTagService;
+
+    private final ExecutorService networkExecutor =
+            Executors.newSingleThreadExecutor(r ->
+            {
+                Thread thread = new Thread(r, "player-tags-network");
+                thread.setDaemon(true);
+                return thread;
+            });
+
+    private final Map<String, CachedInfo> sharedCache =
+            new ConcurrentHashMap<>();
+
+    private final Set<String> lookupsInProgress =
+            ConcurrentHashMap.newKeySet();
+
+    private volatile String lastPublishedSignature;
+    private volatile String lastAttemptSignature;
+    private volatile long lastPublishAttemptTime;
 
     @Provides
     PlayerTagsConfig provideConfig(ConfigManager configManager)
@@ -44,6 +84,69 @@ public class PlayerTagsPlugin extends Plugin
     protected void shutDown()
     {
         overlayManager.remove(overlay);
+        networkExecutor.shutdownNow();
+        sharedCache.clear();
+        lookupsInProgress.clear();
+    }
+
+    @Subscribe
+    public void onGameTick(GameTick event)
+    {
+        publishOwnTagIfNeeded();
+    }
+
+    private void publishOwnTagIfNeeded()
+    {
+        Player localPlayer = client.getLocalPlayer();
+
+        if (localPlayer == null || localPlayer.getName() == null)
+        {
+            return;
+        }
+
+        String playerName = localPlayer.getName();
+        boolean enabled = config.showOwnTag();
+
+        String tag = enabled ? cleanText(config.ownTag()) : "";
+        String pronouns = enabled ? cleanText(config.ownPronouns()) : "";
+
+        String signature = playerName + "\0" + enabled
+                + "\0" + tag + "\0" + pronouns;
+
+        if (signature.equals(lastPublishedSignature))
+        {
+            return;
+        }
+
+        long now = System.currentTimeMillis();
+
+        if (signature.equals(lastAttemptSignature)
+                && now - lastPublishAttemptTime < PUBLISH_RETRY_MS)
+        {
+            return;
+        }
+
+        lastAttemptSignature = signature;
+        lastPublishAttemptTime = now;
+
+        networkExecutor.submit(() ->
+        {
+            try
+            {
+                sharedTagService.publishPlayerTag(
+                        playerName,
+                        tag,
+                        pronouns
+                );
+
+                lastPublishedSignature = signature;
+            }
+            catch (Exception e)
+            {
+                logger.log(Level.WARNING,
+                        "Could not publish Player Tags information", e);
+            }
+        });
     }
 
     PlayerInfo getPlayerInfo(Player player)
@@ -54,103 +157,238 @@ public class PlayerTagsPlugin extends Plugin
         }
 
         Player localPlayer = client.getLocalPlayer();
-        String playerName = normalize(player.getName());
-        String localName = localPlayer == null ? "" : normalize(localPlayer.getName());
 
-        if (playerName.equals(localName))
+        // Your own tooltip is controlled by a local-only setting.
+        if (player == localPlayer)
         {
-            if (!config.showOwnTag())
+            if (!config.showOwnTagLocally())
             {
                 return null;
             }
-            return makeInfo(config.ownTag(), config.ownPronouns());
+
+            return createPlayerInfo(
+                    config.ownTag(),
+                    config.ownPronouns()
+            );
         }
 
-        if (!config.showOtherTags() || isHidden(playerName))
+        if (!config.showOtherTags())
         {
             return null;
         }
 
-        return findOverride(playerName);
-    }
+        String playerName = normalizeName(player.getName());
 
-    private PlayerInfo findOverride(String normalizedName)
-    {
-        String mappings = config.localOverrides();
-        if (mappings == null || mappings.trim().isEmpty())
+        // Hidden players take priority.
+        if (isPlayerHidden(playerName))
         {
             return null;
         }
 
-        for (String line : mappings.split("\\R"))
+        // Local overrides take priority over shared tags.
+        PlayerInfo override = getLocalOverride(playerName);
+
+        if (override != null)
         {
-            int separator = line.indexOf('=');
-            if (separator <= 0)
-            {
-                continue;
-            }
-
-            String name = normalize(line.substring(0, separator).trim());
-            if (!normalizedName.equals(name))
-            {
-                continue;
-            }
-
-            String[] values = line.substring(separator + 1).split("\\|", 2);
-            String tag = values.length > 0 ? values[0] : "";
-            String pronouns = values.length > 1 ? values[1] : "";
-            return makeInfo(tag, pronouns);
+            return override;
         }
+
+        // Return cached shared information, if available.
+        CachedInfo cached = sharedCache.get(playerName);
+
+        if (cached != null)
+        {
+            if (System.currentTimeMillis() < cached.expiresAt)
+            {
+                return cached.info;
+            }
+
+            sharedCache.remove(playerName, cached);
+        }
+
+        // Queue at most one lookup per player.
+        requestSharedLookup(playerName);
+
+        // The tooltip will appear once the lookup completes.
         return null;
     }
 
-    private boolean isHidden(String normalizedName)
+    private void requestSharedLookup(String playerName)
+    {
+        if (!lookupsInProgress.add(playerName))
+        {
+            return;
+        }
+
+        networkExecutor.submit(() ->
+        {
+            try
+            {
+                JsonObject result =
+                        sharedTagService.getPlayerTag(playerName);
+
+                PlayerInfo info = null;
+
+                if (result != null)
+                {
+                    String tag = getJsonString(result, "tag");
+                    String pronouns = getJsonString(result, "pronouns");
+
+                    info = createPlayerInfo(tag, pronouns);
+                }
+
+                long cacheTime = info == null
+                        ? FAILED_LOOKUP_TIME_MS
+                        : CACHE_TIME_MS;
+
+                sharedCache.put(
+                        playerName,
+                        new CachedInfo(
+                                info,
+                                System.currentTimeMillis() + cacheTime
+                        )
+                );
+            }
+            catch (Exception e)
+            {
+                logger.log(Level.FINE,
+                        "Shared tag lookup failed for " + playerName, e);
+
+                sharedCache.put(
+                        playerName,
+                        new CachedInfo(
+                                null,
+                                System.currentTimeMillis() + FAILED_LOOKUP_TIME_MS
+                        )
+                );
+            }
+            finally
+            {
+                lookupsInProgress.remove(playerName);
+            }
+        });
+    }
+
+    private String getJsonString(JsonObject object, String key)
+    {
+        if (!object.has(key) || object.get(key).isJsonNull())
+        {
+            return "";
+        }
+
+        return object.get(key).getAsString();
+    }
+
+    private PlayerInfo getLocalOverride(String playerName)
+    {
+        String overrides = config.localOverrides();
+
+        if (overrides == null || overrides.isEmpty())
+        {
+            return null;
+        }
+
+        for (String line : overrides.split("\\R"))
+        {
+            String[] entry = line.split("=", 2);
+
+            if (entry.length != 2)
+            {
+                continue;
+            }
+
+            String name = normalizeName(entry[0]);
+
+            if (!name.equals(playerName))
+            {
+                continue;
+            }
+
+            String[] values = entry[1].split("\\|", 2);
+
+            String tag = values[0].trim();
+            String pronouns = values.length > 1
+                    ? values[1].trim()
+                    : "";
+
+            return createPlayerInfo(tag, pronouns);
+        }
+
+        return null;
+    }
+
+    private boolean isPlayerHidden(String playerName)
     {
         String hidden = config.hiddenPlayers();
-        if (hidden == null)
+
+        if (hidden == null || hidden.isEmpty())
         {
             return false;
         }
 
         for (String name : hidden.split(","))
         {
-            if (normalizedName.equals(normalize(name.trim())))
+            if (normalizeName(name).equals(playerName))
             {
                 return true;
             }
         }
+
         return false;
     }
 
-    private static PlayerInfo makeInfo(String tag, String pronouns)
+    private String normalizeName(String name)
     {
-        String cleanTag = cleanText(tag);
-        String cleanPronouns = cleanText(pronouns);
-        if (cleanTag.isEmpty() && cleanPronouns.isEmpty())
-        {
-            return null;
-        }
-        return new PlayerInfo(cleanTag, cleanPronouns);
+        return name == null ? ""
+                : name.replace('\u00A0', ' ')
+                .trim()
+                .toLowerCase(Locale.ROOT);
     }
 
-    private static String cleanText(String text)
+    private String cleanText(String text)
     {
         if (text == null)
         {
             return "";
         }
-        String cleaned = text.replaceAll("[\\r\\n\\t]", " ").trim();
-        return cleaned.length() > 32 ? cleaned.substring(0, 32) : cleaned;
+
+        String cleaned = text
+                .replaceAll("[\\r\\n\\t]", " ")
+                .trim();
+
+        return cleaned.length() > 50
+                ? cleaned.substring(0, 50)
+                : cleaned;
     }
 
-    private static String normalize(String name)
+    private PlayerInfo createPlayerInfo(String tag, String pronouns)
     {
-        return name == null ? "" : name.replace('\u00A0', ' ').trim().toLowerCase();
+        String cleanTag = cleanText(tag);
+        String cleanPronouns = cleanText(pronouns);
+
+        if (cleanTag.isEmpty() && cleanPronouns.isEmpty())
+        {
+            return null;
+        }
+
+        return new PlayerInfo(cleanTag, cleanPronouns);
     }
 
     PlayerTagsConfig getConfig()
     {
         return config;
+    }
+
+    private static final class CachedInfo
+    {
+        private final PlayerInfo info;
+        private final long expiresAt;
+
+        private CachedInfo(PlayerInfo info, long expiresAt)
+        {
+            this.info = info;
+            this.expiresAt = expiresAt;
+        }
     }
 
     static final class PlayerInfo
