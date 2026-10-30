@@ -74,6 +74,12 @@ public class PlayerTagsOverlay extends Overlay
                 continue;
             }
 
+            if (player == client.getLocalPlayer()
+                    && !plugin.getConfig().showOwnTagLocally())
+            {
+                continue;
+            }
+
             Shape hull = player.getConvexHull();
             if (hull != null && hull.contains(mouse.getX(), mouse.getY()))
             {

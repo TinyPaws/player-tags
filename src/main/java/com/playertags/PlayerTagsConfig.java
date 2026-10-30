@@ -21,10 +21,21 @@ public interface PlayerTagsConfig extends Config
     }
 
     @ConfigItem(
+            keyName = "showOwnTagLocally",
+            name = "Show my own tag locally",
+            description = "Only controls whether you see your own tag",
+            position = 1
+    )
+    default boolean showOwnTagLocally()
+    {
+        return false;
+    }
+
+    @ConfigItem(
         keyName = "ownTag",
         name = "My custom tag",
         description = "Your custom tag text",
-        position = 1
+        position = 2
     )
     default String ownTag()
     {
@@ -35,7 +46,7 @@ public interface PlayerTagsConfig extends Config
         keyName = "ownPronouns",
         name = "My pronouns",
         description = "Your pronouns (for example, they/them)",
-        position = 2
+        position = 3
     )
     default String ownPronouns()
     {
@@ -46,7 +57,7 @@ public interface PlayerTagsConfig extends Config
         keyName = "showOtherTags",
         name = "Show other players",
         description = "Show information for players with a local override",
-        position = 3
+        position = 4
     )
     default boolean showOtherTags()
     {
@@ -57,7 +68,7 @@ public interface PlayerTagsConfig extends Config
         keyName = "localOverrides",
         name = "Local player overrides",
         description = "One player per line: PlayerName=Custom tag|pronouns (pronouns optional)",
-        position = 4
+        position = 5
     )
     default String localOverrides()
     {
@@ -68,7 +79,7 @@ public interface PlayerTagsConfig extends Config
         keyName = "hiddenPlayers",
         name = "Hidden players",
         description = "Comma-separated player names whose information should be hidden",
-        position = 5
+        position = 6
     )
     default String hiddenPlayers()
     {
@@ -79,7 +90,7 @@ public interface PlayerTagsConfig extends Config
         keyName = "tagColor",
         name = "Text colour",
         description = "Colour used for the custom tag and pronouns in the hover box",
-        position = 6
+        position = 7
     )
     default Color tagColor()
     {
@@ -91,7 +102,7 @@ public interface PlayerTagsConfig extends Config
         keyName = "fontSize",
         name = "Text size",
         description = "Text size inside the hover box",
-        position = 7
+        position = 8
     )
     default int fontSize()
     {
