@@ -5,14 +5,17 @@ import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 
-import java.net.URI;
+import javax.inject.Inject;
+
 import java.net.URLEncoder;
-import java.net.http.HttpClient;
-import java.net.http.HttpRequest;
-import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
-import java.time.Duration;
 import java.util.Locale;
+
+import okhttp3.MediaType;
+import okhttp3.OkHttpClient;
+import okhttp3.Request;
+import okhttp3.RequestBody;
+import okhttp3.Response;
 
 public class SharedTagService
 {
@@ -22,9 +25,16 @@ public class SharedTagService
     private static final String SUPABASE_KEY =
             "sb_publishable_ODJQK7U9lRNx6bv7bBkjpA_GibgA3ib";
 
-    private final HttpClient http = HttpClient.newBuilder()
-            .connectTimeout(Duration.ofSeconds(10))
-            .build();
+    private static final MediaType JSON =
+            MediaType.parse("application/json; charset=utf-8");
+
+    private final OkHttpClient http;
+
+    @Inject
+    public SharedTagService(OkHttpClient http)
+    {
+        this.http = http;
+    }
 
     /**
      * Retrieves a player's shared tag and pronouns.
@@ -38,40 +48,45 @@ public class SharedTagService
 
         String name = URLEncoder.encode(
                 playerName.trim().toLowerCase(Locale.ROOT),
-                StandardCharsets.UTF_8);
+                StandardCharsets.UTF_8.name());
 
         String url = SUPABASE_URL + "/rest/v1/player_tags"
                 + "?select=player_name,tag,pronouns"
                 + "&player_name=eq." + name;
 
-        HttpRequest request = HttpRequest.newBuilder()
-                .uri(URI.create(url))
-                .timeout(Duration.ofSeconds(15))
+        Request request = new Request.Builder()
+                .url(url)
                 .header("apikey", SUPABASE_KEY)
                 .header("Authorization", "Bearer " + SUPABASE_KEY)
-                .GET()
+                .get()
                 .build();
 
-        HttpResponse<String> response =
-                http.send(request, HttpResponse.BodyHandlers.ofString());
-
-        if (response.statusCode() != 200)
+        try (Response response = http.newCall(request).execute())
         {
-            throw new IllegalStateException(
-                    "Shared lookup failed: HTTP "
-                            + response.statusCode()
-                            + " - " + response.body());
+            if (!response.isSuccessful())
+            {
+                throw new IllegalStateException(
+                        "Shared lookup failed: HTTP "
+                                + response.code());
+            }
+
+            if (response.body() == null)
+            {
+                return null;
+            }
+
+            JsonArray results =
+                    new JsonParser()
+                            .parse(response.body().string())
+                            .getAsJsonArray();
+
+            if (results.size() == 0)
+            {
+                return null;
+            }
+
+            return results.get(0).getAsJsonObject();
         }
-
-        JsonArray results =
-                new JsonParser().parse(response.body()).getAsJsonArray();
-
-        if (results.size() == 0)
-        {
-            return null;
-        }
-
-        return results.get(0).getAsJsonObject();
     }
 
     /**
@@ -108,31 +123,33 @@ public class SharedTagService
         String url = SUPABASE_URL
                 + "/rest/v1/player_tags?on_conflict=player_name";
 
-        HttpRequest request = HttpRequest.newBuilder()
-                .uri(URI.create(url))
-                .timeout(Duration.ofSeconds(15))
+        RequestBody requestBody =
+                RequestBody.create(JSON, body.toString());
+
+        Request request = new Request.Builder()
+                .url(url)
                 .header("apikey", SUPABASE_KEY)
                 .header("Authorization", "Bearer " + SUPABASE_KEY)
                 .header("Content-Type", "application/json")
                 .header(
                         "Prefer",
                         "resolution=merge-duplicates,return=minimal")
-                .POST(HttpRequest.BodyPublishers.ofString(
-                        body.toString(),
-                        StandardCharsets.UTF_8))
+                .post(requestBody)
                 .build();
 
-        HttpResponse<String> response =
-                http.send(request, HttpResponse.BodyHandlers.ofString());
-
-        if (response.statusCode() != 200
-                && response.statusCode() != 201
-                && response.statusCode() != 204)
+        try (Response response = http.newCall(request).execute())
         {
-            throw new IllegalStateException(
-                    "Publishing failed: HTTP "
-                            + response.statusCode()
-                            + " - " + response.body());
+            if (!response.isSuccessful())
+            {
+                String error = response.body() == null
+                        ? ""
+                        : response.body().string();
+
+                throw new IllegalStateException(
+                        "Publishing failed: HTTP "
+                                + response.code()
+                                + " - " + error);
+            }
         }
     }
 }
